@@ -1,4 +1,4 @@
-# Deqp Runer
+# Deqp Runner
 Run the Vulkan Conformance Test Suite in parallel and robustly.
 
 This is fork/rewrite of the mesa [parallel deqp runner](https://gitlab.freedesktop.org/mesa/parallel-deqp-runner).
