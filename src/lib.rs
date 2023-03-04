@@ -3,7 +3,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::Write;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -24,16 +23,19 @@ use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+pub mod prelude;
 mod rundeqp;
 pub mod slog_pg;
 pub mod summary;
 
-pub use rundeqp::{run_deqp, RunDeqpState, DeqpEvent};
+pub use rundeqp::{run_deqp, DeqpEvent};
 
 pub use summary::Summary;
 
 /// This many tests will be executed with a single deqp run.
 pub const BATCH_SIZE: usize = 1000;
+/// Name of the file where stdout is saved.
+const STDOUT_FILE: &str = "stdout.txt";
 /// Name of the file where stderr is saved.
 const STDERR_FILE: &str = "stderr.txt";
 /// Name of the file where the test list is saved.
@@ -143,7 +145,19 @@ pub enum TestResultType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TestResult {
+    /// Additional information about the test result.
+    ///
+    /// TODO: This isn't the full stdout -- can we rename it to match its
+    /// meaning without breaking some use cases?
     pub stdout: String,
+
+    /// Full stdout for this test.
+    pub full_stdout: String,
+
+    /// Full stderr, for fatal errors (e.g. Crash)
+    pub stderr: String,
+
+    /// Test result type (pass / fail / etc.)
     pub variant: TestResultType,
 }
 
@@ -207,6 +221,8 @@ pub enum DeqpError {
         #[serde(with = "serde_io_error")]
         std::io::Error,
     ),
+    #[error("Failed to parse deqp output: {error}")]
+    ParseError { error: String },
     #[error("deqp encountered a fatal error")]
     DeqpFatalError,
     #[error("deqp timed out")]
@@ -219,15 +235,8 @@ pub enum DeqpError {
     /// Fatal error
     #[error("deqp did not run any tests")]
     NoTestsRun,
-    /// Fatal error
-    #[error("failedto get deqp process exit code")]
-    NoProcessResult,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct DeqpErrorWithOutput {
-    error: DeqpError,
-    stdout: String,
+    #[error("deqp did not run all tests")]
+    Incomplete,
 }
 
 #[derive(Clone, Debug)]
@@ -245,7 +254,7 @@ pub struct RunOptions {
 #[derive(Debug)]
 pub enum RunTestListEvent<'a, 'list> {
     TestResult(ReproducibleTestResultData<'a, 'list>),
-    DeqpError(DeqpErrorWithOutput),
+    DeqpError(DeqpError),
 }
 
 /// Struct for the `run_log.json` file. Every line in this file is such an entry.
@@ -253,7 +262,7 @@ pub enum RunTestListEvent<'a, 'list> {
 pub enum RunLogEntry<'a> {
     TestResult(#[serde(borrow)] TestResultEntry<'a>),
     /// Error that happened independant of a test.
-    DeqpError(DeqpErrorWithOutput),
+    DeqpError(DeqpError),
 }
 
 /// Entry for a test result in the run log.
@@ -299,9 +308,7 @@ struct RunTestListState<'a, 'list> {
     /// Input to the process that was last started.
     tests: &'list [&'a str],
     options: &'a RunOptions,
-    running: Option<RunDeqpState>,
-    /// Index into current `tests` and start time.
-    cur_test: Option<(usize, OffsetDateTime)>,
+    pid: Option<u32>,
     last_finished: Option<usize>,
 
     /// Temporary file that contains the test list and is passed to deqp.
@@ -328,7 +335,7 @@ impl DeqpError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::SpawnFailed(_) | Self::StartError(_) | Self::NoTestsRun | Self::NoProcessResult
+            Self::SpawnFailed(_) | Self::StartError(_) | Self::NoTestsRun | Self::Timeout
         )
     }
 }
@@ -353,10 +360,12 @@ impl TestResultType {
     /// while it was failing before.
     pub fn merge(self, other: Self) -> (Self, bool) {
         if self.is_failure() && !other.is_failure() {
-            (Self::Flake(Box::new(self)), false)
-        } else {
-            (other, true)
+            return (Self::Flake(Box::new(self)), false);
         }
+        if other.is_failure() && !self.is_failure() && !matches!(self, Self::Flake(_)) {
+            return (Self::Flake(Box::new(other)), true);
+        }
+        (self, false)
     }
 }
 
@@ -367,8 +376,8 @@ impl<'a> From<TestResultData<'a>> for JobEvent<'a> {
     }
 }
 
-impl<'a> From<DeqpErrorWithOutput> for JobEvent<'a> {
-    fn from(err: DeqpErrorWithOutput) -> Self {
+impl<'a> From<DeqpError> for JobEvent<'a> {
+    fn from(err: DeqpError) -> Self {
         Self::RunLogEntry(RunLogEntry::DeqpError(err))
     }
 }
@@ -379,8 +388,7 @@ impl<'a, 'list> RunTestListState<'a, 'list> {
             logger,
             tests,
             options,
-            running: None,
-            cur_test: None,
+            pid: None,
             last_finished: None,
 
             test_list_file: None,
@@ -392,22 +400,18 @@ impl<'a, 'list> RunTestListState<'a, 'list> {
     ///
     /// Returns the arguments for starting the process.
     /// We cannot start the process here because we cannot name the type of [`run_deqp`].
-    fn start(&mut self) -> Result<Vec<String>, DeqpErrorWithOutput> {
+    fn start(&mut self) -> Result<Vec<String>, DeqpError> {
         // TODO pipeline dumps
         // Create a temporary file for the test list
-        let mut temp_file = NamedTempFile::new().map_err(|e| DeqpErrorWithOutput {
-            error: DeqpError::StartError(format!(
-                "Failed to create temporary file for test list: {e}"
-            )),
-            stdout: String::new(),
-        })?;
+        let mut temp_file = NamedTempFile::new().map_err(
+            |e| DeqpError::StartError(format!(
+                "Failed to create temporary file for test list: {e}"))
+        )?;
         for t in self.tests {
-            writeln!(&mut temp_file, "{t}").map_err(|e| DeqpErrorWithOutput {
-                error: DeqpError::StartError(format!(
-                    "Failed to write temporary file for test list: {e}"
-                )),
-                stdout: String::new(),
-            })?;
+            writeln!(&mut temp_file, "{t}").map_err(
+                |e| DeqpError::StartError(format!(
+                    "Failed to write temporary file for test list: {e}"))
+            )?;
         }
 
         let mut args = self.options.args.clone();
@@ -416,99 +420,107 @@ impl<'a, 'list> RunTestListState<'a, 'list> {
                 .path()
                 .as_os_str()
                 .to_str()
-                .ok_or_else(|| DeqpErrorWithOutput {
-                    error: DeqpError::StartError(format!(
+                .ok_or_else(|| DeqpError::StartError(format!(
                         "Failed to get name of temporary file for test list (path: {:?})",
                         temp_file.path()
-                    )),
-                    stdout: String::new(),
-                })?
+                    )))?
                 .into(),
         );
-        self.cur_test = None;
         self.last_finished = None;
         self.fail_dir = None;
         self.test_list_file = Some(temp_file);
         Ok(args)
     }
 
-    fn create_fail_dir(&mut self, failed_test: &str) {
-        if self.fail_dir.is_none() {
-            if let Some(dir) = &self.options.fail_dir {
-                for i in 0.. {
-                    let dir_name = if i == 0 {
-                        failed_test.to_string()
-                    } else {
-                        format!("{failed_test}-{i}")
-                    };
-                    let new_dir = dir.join(&dir_name);
-                    if !new_dir.exists() {
-                        if let Err(e) = std::fs::create_dir_all(&new_dir) {
-                            error!(self.logger, "Failed to create failure directory";
-                                "error" => %e);
-                            return;
-                        }
-                        self.fail_dir = Some(dir_name);
-                        // Write reproduce-list.txt
-                        match std::fs::File::create(new_dir.join(TEST_LIST_FILE)) {
-                            Ok(mut f) => {
-                                if let Err(e) = (|| -> Result<(), std::io::Error> {
-                                    // Write options
-                                    write!(&mut f, "#!")?;
-                                    if self
-                                        .options
-                                        .args
-                                        .first()
-                                        .map(|a| !a.starts_with('/'))
-                                        .unwrap_or_default()
-                                    {
-                                        write!(&mut f, "/usr/bin/env -S ")?;
-                                    }
-                                    writeln!(
-                                        &mut f,
-                                        "{}",
-                                        self.options
-                                            .args
-                                            .iter()
-                                            .map(|a| a.replace('\n', "\\n"))
-                                            .collect::<Vec<_>>()
-                                            .join(" ")
-                                    )?;
+    fn create_fail_dir(&mut self, failed_test: &str, stdout: &str, stderr: &str) {
+        if self.fail_dir.is_some() {
+            return;
+        }
 
-                                    // Write tests
-                                    for t in self.tests {
-                                        writeln!(&mut f, "{t}")?;
-                                    }
-                                    Ok(())
-                                })() {
-                                    error!(self.logger, "Failed to write reproduce list";
-                                        "error" => %e);
-                                }
-                            }
-                            Err(e) => {
-                                error!(self.logger, "Failed to create reproduce list file";
-                                    "error" => %e);
-                            }
-                        }
-                        break;
+        let Some(dir) = &self.options.fail_dir else { return };
+
+        let mut i = 0;
+        let fail_dir = loop {
+            let dir_name = if i == 0 {
+                failed_test.to_string()
+            } else {
+                format!("{failed_test}-{i}")
+            };
+            let new_dir = dir.join(&dir_name);
+            if new_dir.exists() {
+                i += 1;
+                continue;
+            }
+            if let Err(e) = std::fs::create_dir_all(&new_dir) {
+                error!(self.logger, "Failed to create failure directory";
+                    "error" => %e);
+                return;
+            }
+            self.fail_dir = Some(dir_name);
+            break new_dir
+        };
+
+        // Write reproduce-list.txt
+        match std::fs::File::create(fail_dir.join(TEST_LIST_FILE)) {
+            Ok(mut f) => {
+                if let Err(e) = (|| -> Result<(), std::io::Error> {
+                    // Write options
+                    write!(&mut f, "#!")?;
+                    if self
+                        .options
+                        .args
+                        .first()
+                        .map(|a| !a.starts_with('/'))
+                        .unwrap_or_default()
+                    {
+                        write!(&mut f, "/usr/bin/env -S ")?;
                     }
+                    writeln!(
+                        &mut f,
+                        "{}",
+                        self.options
+                            .args
+                            .iter()
+                            .map(|a| a.replace('\n', "\\n"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )?;
+
+                    // Write tests
+                    for t in self.tests {
+                        writeln!(&mut f, "{t}")?;
+                    }
+                    Ok(())
+                })() {
+                    error!(self.logger, "Failed to write reproduce list";
+                        "error" => %e);
+                }
+            }
+            Err(e) => {
+                error!(self.logger, "Failed to create reproduce list file";
+                    "error" => %e);
+            }
+        }
+
+        if !stdout.is_empty() {
+            // Save stdout
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(fail_dir.join(STDOUT_FILE))
+            {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(stdout.as_bytes()) {
+                        error!(self.logger, "Failed to write stdout file"; "error" => %e);
+                    }
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to create stdout file"; "error" => %e);
                 }
             }
         }
 
-        if let Some(running) = &mut self.running {
-            if !running.stderr.is_empty() {
-                // Save current stderr
-                let stderr = mem::take(&mut running.stderr);
-                self.save_fail_dir_stderr(&stderr);
-            }
-        }
-    }
-
-    /// Save stderr to the current `fail_dir` if there is one.
-    fn save_fail_dir_stderr(&self, stderr: &str) {
-        if let Some(dir_name) = &self.fail_dir {
-            let fail_dir = self.options.fail_dir.as_ref().unwrap().join(dir_name);
+        if !stderr.is_empty() {
             // Save stderr
             match std::fs::OpenOptions::new()
                 .create(true)
@@ -524,191 +536,109 @@ impl<'a, 'list> RunTestListState<'a, 'list> {
                     error!(self.logger, "Failed to create stderr file"; "error" => %e);
                 }
             }
-        } else {
-            warn!(
-                self.logger,
-                "Tried to save stderr without a fail dir set, ignoring"
-            );
         }
     }
 
-    fn get_missing(&self, count: usize) -> Vec<RunTestListEvent<'a, 'list>> {
-        let start = self.last_finished.map(|i| i + 1).unwrap_or_default();
-        let pid = self.running.as_ref().map(|r| r.pid);
-        (0..count)
+    fn get_missing(&self, range: impl Iterator<Item=usize>) -> Vec<RunTestListEvent<'a, 'list>> {
+        range
+            .take_while(|&i| i < self.tests.len())
             .map(|i| {
                 RunTestListEvent::TestResult(ReproducibleTestResultData {
                     data: TestResultData {
-                        name: self.tests[start + i],
+                        name: self.tests[i],
                         result: TestResult {
                             stdout: String::new(),
+                            full_stdout: String::new(),
+                            stderr: String::new(),
                             variant: TestResultType::Missing,
                         },
                         start: OffsetDateTime::now_utc(),
                         duration: Duration::new(0, 0),
-                        pid,
+                        pid: self.pid,
                         fail_dir: None,
                     },
-                    run_list: &self.tests[..start + i + 1],
+                    run_list: &self.tests[..i + 1],
                     args: &self.options.args,
                 })
             })
             .collect()
     }
 
-    fn handle_test_start(&mut self, name: &str) -> Vec<RunTestListEvent<'a, 'list>> {
-        trace!(self.logger, "Test started"; "test" => name);
+    fn handle_test(&mut self, name: String, start: OffsetDateTime,
+                   duration: Duration, result: TestResult) -> Vec<RunTestListEvent<'a, 'list>> {
+        trace!(self.logger, "Test report"; "test" => &name, "result" => ?result);
         let next_test = self.last_finished.map(|i| i + 1).unwrap_or_default();
-        if let Some(i) = self.tests[next_test..].iter().position(|t| t == &name) {
-            self.cur_test = Some((next_test + i, OffsetDateTime::now_utc()));
-            self.get_missing(i)
-        } else {
+        let Some(i) = self.tests[next_test..].iter().position(|t| t == &name) else {
             warn!(self.logger, "Executing unknown test"; "test" => name);
-            Vec::new()
-        }
-    }
-
-    fn handle_test_end(&mut self, result: TestResult) -> Option<RunTestListEvent<'a, 'list>> {
-        trace!(self.logger, "Test end"; "cur_test" => ?self.cur_test, "result" => ?result);
-        if let Some(cur_test) = self.cur_test.take() {
-            self.last_finished = Some(cur_test.0);
-            let duration = OffsetDateTime::now_utc() - cur_test.1;
-            let is_failure = result.variant.is_failure();
-            if is_failure {
-                self.create_fail_dir(self.tests[cur_test.0]);
-            }
-
-            Some(RunTestListEvent::TestResult(ReproducibleTestResultData {
-                data: TestResultData {
-                    name: self.tests[cur_test.0],
-                    result,
-                    start: cur_test.1,
-                    duration,
-                    pid: self.running.as_ref().map(|r| r.pid),
-                    fail_dir: if is_failure {
-                        self.fail_dir.clone()
-                    } else {
-                        None
-                    },
-                },
-                run_list: &self.tests[..cur_test.0 + 1],
-                args: &self.options.args,
-            }))
-        } else {
-            warn!(self.logger, "Finished test without starting a test";
-                "last-finished" => ?self.last_finished.map(|i| self.tests[i]));
-            None
-        }
-    }
-
-    fn handle_finished(&mut self, state: RunDeqpState) -> Vec<RunTestListEvent<'a, 'list>> {
-        trace!(self.logger, "Finished"; "result" => ?state.finished_result,
-            "stdout" => &state.stdout, "stderr" => &state.stderr);
-
-        let mut is_failure = true;
-        let pid = state.pid;
-        let res = if let Some(cur_test) = self.cur_test {
-            let duration = OffsetDateTime::now_utc() - cur_test.1;
-            self.create_fail_dir(self.tests[cur_test.0]);
-
-            if state
-                .finished_result
-                .as_ref()
-                .map(Result::is_ok)
-                .unwrap_or_default()
-            {
-                warn!(self.logger, "test not finished but deqp exited successful, count as failure";
-                    "cur_test" => self.tests[cur_test.0], "started" => %cur_test.1);
-            }
-
-            // Continue testing
-            let run_list = &self.tests[..cur_test.0 + 1];
-            self.tests = &self.tests[cur_test.0 + 1..];
-
-            let result_data = RunTestListEvent::TestResult(ReproducibleTestResultData {
-                data: TestResultData {
-                    name: run_list[cur_test.0],
-                    result: TestResult {
-                        stdout: state.stdout,
-                        variant: if matches!(state.finished_result, Some(Err(DeqpError::Timeout))) {
-                            TestResultType::Timeout
-                        } else {
-                            TestResultType::Crash
-                        },
-                    },
-                    start: cur_test.1,
-                    duration,
-                    pid: Some(state.pid),
-                    fail_dir: self.fail_dir.clone(),
-                },
-                run_list,
-                args: &self.options.args,
-            });
-
-            let mut res = Vec::new();
-            if let Some(Err(e)) = state.finished_result {
-                if e.is_fatal() {
-                    res.push(RunTestListEvent::DeqpError(DeqpErrorWithOutput {
-                        error: e,
-                        stdout: String::new(),
-                    }));
-                }
-            }
-            res.push(result_data);
-
-            trace!(self.logger, "Test finish returns"; "result" => ?res);
-            res
-        } else if let Some(e) = state.finished_result.map(Result::err).unwrap_or_else(|| {
-            error!(self.logger, "Process result is not set, aborting"; "pid" => pid);
-            Some(DeqpError::NoProcessResult)
-        }) {
-            if let Some(last_finished) = self.last_finished {
-                self.create_fail_dir(self.tests[last_finished]);
-                // No current test executed, so probably some tests are failing, therefore the exit
-                // status is not 0
-                // Mark rest of tests as missing
-                let mut r = self.get_missing(self.tests.len() - last_finished - 1);
-                self.tests = &[];
-                if e.is_fatal() {
-                    r.push(RunTestListEvent::DeqpError(DeqpErrorWithOutput {
-                        error: e,
-                        stdout: state.stdout,
-                    }));
-                }
-                r
-            } else {
-                self.create_fail_dir(UNKNOWN_TEST_NAME);
-                // No test executed, counts as fatal error
-                self.tests = &[];
-                warn!(self.logger, "Deqp exited without running tests, aborting"; "error" => ?e);
-                vec![RunTestListEvent::DeqpError(DeqpErrorWithOutput {
-                    error: DeqpError::NoTestsRun,
-                    stdout: state.stdout,
-                })]
-            }
-        } else {
-            is_failure = false;
-            let r = if let Some(last_finished) = self.last_finished {
-                // Mark rest of tests as missing
-                debug!(self.logger, "not all missing"; "tests" => ?self.tests,
-                    "last" => last_finished);
-                self.get_missing(self.tests.len() - last_finished - 1)
-            } else {
-                // No test executed, counts all tests as missing
-                debug!(self.logger, "all missing"; "tests" => ?self.tests);
-                self.get_missing(self.tests.len())
-            };
-            self.tests = &[];
-            r
+            return Vec::new()
         };
+        let current_test = next_test + i;
 
-        if is_failure && self.fail_dir.is_some() {
-            // Create a fail dir if there is none yet
-            self.create_fail_dir(UNKNOWN_TEST_NAME);
-            // Save rest of stderr
-            self.save_fail_dir_stderr(&state.stderr);
+        let mut events = self.get_missing(next_test..current_test);
+        self.last_finished = Some(current_test);
+
+        let is_failure = result.variant.is_failure();
+        if is_failure {
+            self.create_fail_dir(self.tests[current_test], &result.full_stdout, &result.stderr);
         }
-        res
+
+        events.push(RunTestListEvent::TestResult(ReproducibleTestResultData {
+            data: TestResultData {
+                name: self.tests[current_test],
+                start,
+                duration,
+                result,
+                pid: self.pid,
+                fail_dir: if is_failure {
+                    self.fail_dir.clone()
+                } else {
+                    None
+                },
+            },
+            run_list: &self.tests[..current_test + 1],
+            args: &self.options.args,
+        }));
+
+        events
+    }
+
+    fn handle_finished(&mut self, error: Option<DeqpError>, stdout: String, stderr: String)
+        -> Vec<RunTestListEvent<'a, 'list>>
+    {
+        trace!(self.logger, "Finished"; "error" => ?error);
+
+        if let Some(error) = error {
+            if self.fail_dir.is_none() {
+                // Received a failure that seems independent from test runs.
+                // Could point to a real error, e.g. crash when a Vulkan context
+                // is destroyed.
+                self.create_fail_dir(if let Some(last_finished) = self.last_finished {
+                    self.tests[last_finished]
+                } else {
+                    UNKNOWN_TEST_NAME
+                }, &stdout, &stderr);
+            }
+
+            if let Some(last_finished) = self.last_finished {
+                self.tests = &self.tests[last_finished + 1..];
+            } else {
+                // No test could be run at all, guard against an infinite loop.
+                self.tests = &[];
+            }
+
+            if error.is_fatal() {
+                return vec![RunTestListEvent::DeqpError(error)];
+            }
+            return Vec::new();
+        }
+
+        // deqp ran to completion, which means that any remaining tests must be
+        // missing.
+        let events =
+            self.last_finished.map(|i| self.get_missing((i + 1)..))
+                .unwrap_or_else(Vec::new);
+        self.tests = &[];
+        events
     }
 }
 
@@ -993,52 +923,35 @@ pub fn run_test_list<'a, 'list>(
     let mut state = RunTestListState::new(logger, tests, options);
 
     gen!({
-        loop {
-            if state.tests.is_empty() {
-                return;
-            }
-            if state.running.is_none() {
-                let args = match state.start() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Cannot create test list, fatal error
-                        state.tests = &[];
-                        yield_!(RunTestListEvent::DeqpError(e));
-                        return;
-                    }
-                };
-                match run_deqp(state.logger.clone(), options.timeout, &args, &[]) {
-                    Ok(r) => state.running = Some(r),
-                    Err(e) => {
-                        yield_!(RunTestListEvent::DeqpError(DeqpErrorWithOutput {
-                            error: e,
-                            stdout: "Failed to start deqp process".into(),
-                        }));
-                        return;
-                    }
+        while !state.tests.is_empty() {
+            let args = match state.start() {
+                Ok(r) => r,
+                Err(e) => {
+                    // Cannot create test list, fatal error
+                    state.tests = &[];
+                    yield_!(RunTestListEvent::DeqpError(e));
+                    return;
                 }
-            }
+            };
 
-            let running = state.running.as_mut().unwrap();
-            match running.next().await {
-                None => {
-                    let running = state.running.take().unwrap();
-                    for r in state.handle_finished(running) {
-                        yield_!(r);
+            let mut deqp = run_deqp(state.logger.clone(), options.timeout, &args, &[]);
+            while let Some(event) = deqp.next().await {
+                match event {
+                    DeqpEvent::Launch { pid } => {
+                        state.pid = Some(pid);
+                    }
+                    DeqpEvent::Test { name, start, duration, result } => {
+                        for r in state.handle_test(name, start, duration, result) {
+                            yield_!(r);
+                        }
+                    }
+                    DeqpEvent::Finished { error, stdout, stderr } => {
+                        for r in state.handle_finished(error, stdout, stderr) {
+                            yield_!(r);
+                        }
+                        break;
                     }
                 }
-                Some(e) => match e {
-                    DeqpEvent::TestStart { name } => {
-                        for r in state.handle_test_start(&name) {
-                            yield_!(r);
-                        }
-                    }
-                    DeqpEvent::TestEnd { result } => {
-                        if let Some(r) = state.handle_test_end(result) {
-                            yield_!(r);
-                        }
-                    }
-                },
             }
         }
     })
@@ -1202,7 +1115,7 @@ pub async fn run_tests_parallel<'a>(
                                 }
                             }
                             RunLogEntry::DeqpError(e) => {
-                                if e.error.is_fatal() {
+                                if e.is_fatal() {
                                     fatal_error = true;
                                 }
                             }
@@ -1399,8 +1312,6 @@ mod tests {
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_ccw_point_mode", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode", TestResultType::Crash),
-            ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.512x512", TestResultType::Missing),
-            ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.1024x1024", TestResultType::Missing),
         ];
 
         check_tests(
@@ -1526,7 +1437,7 @@ mod tests {
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_ccw", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_ccw_point_mode", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw", TestResultType::Pass),
-            ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode", TestResultType::Crash),
+            ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode", TestResultType::Flake(Box::new(TestResultType::Crash))),
             ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.512x512", TestResultType::NotSupported),
             ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.1024x1024", TestResultType::NotSupported),
         ];
@@ -1538,7 +1449,7 @@ mod tests {
                 // TODO Check bisection result with get_test_results returned by check_tests
                 let res = summary.0.get("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode").unwrap();
                 assert_eq!(res.1.as_ref().unwrap().fail_dir, None);
-                assert_eq!(res.0.run_id, Some(25));
+                assert_eq!(res.0.run_id, Some(15));
             }
         )
         .await?;
@@ -1683,14 +1594,14 @@ mod tests {
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_ccw", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_ccw_point_mode", TestResultType::Pass),
             ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw", TestResultType::Pass),
-            ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode", TestResultType::Crash),
+            ("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode", TestResultType::Pass),
             ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.512x512", TestResultType::Missing),
             ("dEQP-VK.fragment_shader_interlock.basic.discard.ssbo.shading_rate_unordered.4xaa.sample_shading.1024x1024", TestResultType::Missing),
         ];
 
         check_tests_intern(
             &logger,
-            &["test/test-runner.sh", "logs/d", "/dev/null", "0"],
+            &["test/test-runner.sh", "logs/e", "/dev/null", "0"],
             &expected,
             |summary| {
                 let res = summary.0.get("dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode").unwrap();

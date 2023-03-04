@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(count, 1, "Test case count does not match");
         let test = &report.testsuites()[0].testcases[0];
         assert_eq!(test.name, "dEQP-VK.tessellation.primitive_discard.triangles_fractional_even_spacing_cw_point_mode");
-        assert!(test.is_failure());
+        assert!(test.is_success()); // Flake counted as success
 
         Ok(())
     }
