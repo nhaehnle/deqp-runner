@@ -24,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 pub mod prelude;
+pub mod pti;
 mod rundeqp;
 pub mod slog_pg;
 pub mod summary;
