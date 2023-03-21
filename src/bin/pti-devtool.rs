@@ -3,12 +3,15 @@ use serde::Deserialize;
 
 use deqp_runner::pti::{self, *};
 use rand::prelude::*;
-use utils::Result;
+use utils::{Result, sync_try};
 
 #[derive(Debug, Clone, Subcommand)]
 enum Action {
     DevSample,
     DevTryRun,
+    DevShowMain,
+    DevBuildMain,
+    ClearBuildFail { id: u64 },
 }
 
 #[derive(Debug, Parser)]
@@ -35,9 +38,12 @@ struct Cli {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct Config {
     deqp_vk: std::path::PathBuf,
     deqp_cases: Option<std::path::PathBuf>,
+    sut: sut::SoftwareUnderTest,
+    builds: builds::BuildMgrConfig,
 }
 
 fn do_main() -> Result<()> {
@@ -64,18 +70,41 @@ fn do_main() -> Result<()> {
     let suite = pti::vulkancts::get_caselist(&vulkan_cts_config)?;
     let mut sampler = pti::suite::Sampler::new(&suite)?;
 
-    match args.action {
-    Action::DevSample => {
-        for _ in 0..20 {
-            let test = sampler.sample(&suite, &mut rng);
-            println!("{}", suite.get_name(test));
+    tokio::runtime::Builder::new_current_thread().enable_all().build()?
+    .block_on(async {
+        let mut build_mgr = sync_try(
+            || { builds::BuildMgr::new(config.builds.clone(), config.sut.clone()) },
+            || "setting up BuildMgr")?;
+
+        match args.action {
+        Action::DevSample => {
+            for _ in 0..20 {
+                let test = sampler.sample(&suite, &mut rng);
+                println!("{}", suite.get_name(test));
+            }
+        },
+        Action::DevTryRun => {
+            let tests: Vec<_> = std::iter::repeat_with(|| sampler.sample(&suite, &mut rng)).take(20).collect();
+            vulkancts::run_tests(&vulkan_cts_config, &suite, &tests)?;
+        },
+        Action::DevShowMain => {
+            let main_rev = config.sut.get_main_revision().await?;
+            println!("{main_rev:?}");
+            println!("{}", serde_yaml::to_string(&main_rev)?);
+            println!("{}", serde_json::to_string(&main_rev)?);
+        },
+        Action::DevBuildMain => {
+            let main_rev = config.sut.get_main_revision().await?;
+            println!("get: {:?}", build_mgr.get_build(&main_rev));
+            println!("get_or_build: {:?}", build_mgr.get_or_make_build(&main_rev).await);
+        },
+        Action::ClearBuildFail { id } => {
+            sync_try(|| build_mgr.clear_fail(id), || "clearing failed build")?;
+        },
         }
-    },
-    Action::DevTryRun => {
-        let tests: Vec<_> = std::iter::repeat_with(|| sampler.sample(&suite, &mut rng)).take(20).collect();
-        vulkancts::run_tests(&vulkan_cts_config, &suite, &tests)?;
-    },
-    }
+
+        Result::Ok(())
+    })?;
 
     Ok(())
 }

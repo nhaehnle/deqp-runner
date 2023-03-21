@@ -35,7 +35,7 @@ slog-envlogger = { version = "2", optional = true }
 slog-term = { version = "2", optional = true }
 tempfile = "3"
 thiserror = "1"
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 tokio-stream = "0.1"
 

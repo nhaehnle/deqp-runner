@@ -6,7 +6,7 @@ use futures::prelude::*;
 use slog::{Drain, o};
 
 use super::*;
-use super::utils::{Result, try_forward};
+use super::utils::{Result, sync_try};
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -48,7 +48,7 @@ fn parse_caselist(suite: &mut suite::Suite, path: &std::path::Path) -> Result<()
 }
 
 pub fn get_caselist(config: &Config) -> Result<suite::Suite> {
-    try_forward(|| {
+    sync_try(|| {
         let Some(deqp_vk) = config.deqp_vk.to_str() else {
             return Err("deqp_vk path not valid UTF-8?".into())
         };
@@ -105,7 +105,7 @@ pub fn get_caselist(config: &Config) -> Result<suite::Suite> {
 }
 
 pub fn run_tests(config: &Config, suite: &suite::Suite, tests: &[suite::TestRef]) -> Result<()> {
-    try_forward(|| {
+    sync_try(|| {
         let decorator = slog_term::PlainDecorator::new(std::io::stdout());
         let drain = slog_term::CompactFormat::new(decorator).build().fuse();
         let drain = slog_async::Async::new(drain).build().fuse();
