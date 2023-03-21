@@ -1,8 +1,10 @@
 use std::io::prelude::*;
+use std::error::Error;
+use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::path::Path;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// Return an iterator that produces the items from `iterator`, inserting
 /// clones of `item` in between each one.
@@ -62,12 +64,12 @@ pub fn try_forward<'a, F, R, C, S>(f: F, prefix: C) -> Result<R>
         prefix: String,
         cause: Box<dyn std::error::Error>,
     }
-    impl std::fmt::Display for WrappedError {
+    impl Display for WrappedError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}: {}", self.prefix, self.cause)
         }
     }
-    impl std::error::Error for WrappedError {}
+    impl Error for WrappedError {}
 
     match f() {
     Err(err) => Err(Box::new(WrappedError {
@@ -76,6 +78,19 @@ pub fn try_forward<'a, F, R, C, S>(f: F, prefix: C) -> Result<R>
     })),
     Ok(result) => Ok(result)
     }
+}
+
+pub fn error<T: Debug + Display>(t: T) -> impl Error {
+    #[derive(Debug)]
+    struct WrappedError<T>(T);
+    impl<T: Display> std::fmt::Display for WrappedError<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+    impl<T: Debug + Display> Error for WrappedError<T> {}
+
+    WrappedError(t)
 }
 
 fn read_bytes_impl(path: &Path) -> Result<Vec<u8>> {
