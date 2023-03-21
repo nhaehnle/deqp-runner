@@ -40,3 +40,21 @@ impl<T, F: Future<Output=T>> OptionFutureExt<F> for Option<F> {
         }
     }
 }
+
+// Replace by trim_ascii_{start,end} once stabilized.
+pub trait ByteSliceExt {
+    fn trim_whitespace_start(&self) -> &[u8];
+    fn trim_whitespace_end(&self) -> &[u8];
+}
+impl ByteSliceExt for [u8] {
+    fn trim_whitespace_start(&self) -> &[u8] {
+        let count = self.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        &self[count..]
+    }
+
+    fn trim_whitespace_end(&self) -> &[u8] {
+        let count = self.iter().rev().take_while(|b| b.is_ascii_whitespace())
+                        .count();
+        &self[..self.len() - count]
+    }
+}
